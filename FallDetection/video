@@ -1,0 +1,250 @@
+# Fall detector video class
+# Source: socket stream from laptop webcam (TCP port 8485)
+#
+# Kim Salmi, kim.salmi(at)iki(dot)fi
+# http://tunn.us/arduino/falldetector.php
+# License: GPLv3
+
+# 01-Jun-2018: Original version only detects Not Moving
+# Modified the codes to detect fall
+# Once fall is detected, alarm will be activated
+
+import time
+import cv2
+import person
+import settings
+import webservice
+import bs
+import os
+import socket
+import struct
+import numpy as np
+
+class Video:
+    def __init__(self):
+        self.settings = settings.Settings()
+        
+        # SOCKET CONNECTION TO LAPTOP - UPDATE THIS IP
+        LAPTOP_IP = "172.25.208.1"  # ← CHANGE TO YOUR LAPTOP IP (ipconfig)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((LAPTOP_IP, 8485))
+        print(f"Connected to laptop stream at {LAPTOP_IP}:8485")
+        self.payload_size = 4  # 4 bytes for frame length
+        
+        self.bs = bs.Bs()
+        self.persons = person.Persons(self.settings.movementMaximum, 
+            self.settings.movementMinimum, self.settings.movementTime)
+        self.start = time.time()
+        self.webservice = webservice.Webservice(
+            self.settings.location, 
+            self.settings.phone, 
+            self.settings.email, 
+            self.settings.mailgun_api_key or "",
+            self.settings.telegram_token,
+            self.settings.telegram_chat_id
+        )
+        self.errorcount = 0
+        self.alertLog = []
+        self.frameCount = 1
+        self.waitKey = 25
+
+    def nextFrame(self):
+        try:
+            # Read frame length
+            data = b""
+            while len(data) < self.payload_size:
+                packet = self.sock.recv(self.payload_size - len(data))
+                if not packet:
+                    print("Socket connection lost - reconnecting...")
+                    self.sock.close()
+                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.sock.connect((LAPTOP_IP, 8485))
+                    return
+                data += packet
+            
+            frame_len = struct.unpack("!I", data)[0]
+            
+            # Read frame bytes
+            data = b""
+            while len(data) < frame_len:
+                packet = self.sock.recv(frame_len - len(data))
+                if not packet:
+                    print("Socket connection lost")
+                    return
+                data += packet
+            
+            # Decode JPEG to image
+            jpg = np.frombuffer(data, dtype=np.uint8)
+            self.frame = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
+            
+            if self.frame is None:
+                print("Failed to decode frame")
+                return
+                
+            self.convertFrame()
+        except Exception as e:
+            print(f"nextFrame error: {e}")
+
+    def showFrame(self):
+        if self.settings.debug:
+            cv2.imshow("Thresh", self.thresh)
+        cv2.imshow("Feed", self.frame)
+
+    def destroyNow(self):
+        try:
+            self.sock.close()
+        except:
+            pass
+        cv2.destroyAllWindows()
+
+    def testDestroy(self):
+        key = cv2.waitKey(self.waitKey) & 0xFF
+        if key == ord("q"):
+            self.destroyNow()
+            return 1
+        return 0
+
+    def resetBackgroundFrame(self):
+        print('resetbackgroundFrame - socket mode')
+        self.bs.resetBackgroundIfNeeded(self.frame)
+        self.persons = person.Persons(self.settings.movementMaximum, 
+            self.settings.movementMinimum, self.settings.movementTime)
+
+    def testBackgroundFrame(self):
+        key = cv2.waitKey(self.waitKey) & 0xFF
+        if key == ord("n"):
+            self.bs.deleteBackground()
+
+    def updateBackground(self):
+        self.bs.updateBackground(self.frame)
+
+    def testSettings(self):
+        key = cv2.waitKey(self.waitKey) & 0xFF
+        if key == ord("0"):
+            self.settings.minArea += 50
+            print("minArea:", self.settings.minArea)
+        elif key == ord("9"):
+            self.settings.minArea -= 50
+            print("minArea:", self.settings.minArea)
+        elif key == ord("8"):
+            self.settings.dilationPixels += 1
+            print("dilationPixels:", self.settings.dilationPixels)
+        elif key == ord("7"):
+            self.settings.dilationPixels -= 1
+            print("dilationPixels:", self.settings.dilationPixels)
+        elif key == ord("6"):
+            self.settings.thresholdLimit += 1
+            print("thresholdLimit:", self.settings.thresholdLimit)
+        elif key == ord("5"):
+            self.settings.thresholdLimit -= 1
+            print("thresholdLimit:", self.settings.thresholdLimit)
+        elif key == ord("4"):
+            self.settings.movementMaximum += 1
+            print("movementMaximum:", self.settings.movementMaximum)
+        elif key == ord("3"):
+            self.settings.movementMaximum -= 1
+            print("movementMaximum:", self.settings.movementMaximum)
+        elif key == ord("2"):
+            self.settings.movementMinimum += 1
+            print("movementMinimum:", self.settings.movementMinimum)
+        elif key == ord("1"):
+            self.settings.movementMinimum -= 1
+            print("movementMinimum:", self.settings.movementMinimum)
+        elif key == ord("o"):
+            self.settings.useGaussian = not self.settings.useGaussian
+            print(f"useGaussian: {'on' if self.settings.useGaussian else 'off'}")
+            self.resetBackgroundFrame()
+        elif key == ord("+"):
+            self.settings.movementTime += 1
+            print("movementTime:", self.settings.movementTime)
+        elif key == ord("p"):
+            self.settings.movementTime -= 1
+            print("movementTime:", self.settings.movementTime)
+
+    def convertFrame(self):
+        if self.settings.useResize:
+            r = 750.0 / self.frame.shape[1]
+            dim = (750, int(self.frame.shape[0] * r))
+            self.frame = cv2.resize(self.frame, dim, interpolation=cv2.INTER_AREA)
+        if self.settings.useBw:
+            self.frame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+        if self.settings.useGaussian:
+            self.frame = cv2.GaussianBlur(self.frame, (
+                self.settings.gaussianPixels, self.settings.gaussianPixels), 0)
+
+    def compare(self):
+        self.thresh = self.bs.compareBackground(self.frame)
+        self.thresh = cv2.dilate(self.thresh, None, 
+            iterations=self.settings.dilationPixels)
+        _, contours, _ = cv2.findContours(self.thresh.copy(), cv2.RETR_EXTERNAL, 
+            cv2.CHAIN_APPROX_SIMPLE)
+        
+        self.persons.tick()
+        detectStatus = "idle"
+
+        for contour in contours:
+            if cv2.contourArea(contour) < self.settings.minArea:
+                continue
+
+            (x, y, w, h) = cv2.boundingRect(contour)
+            person = self.persons.addPerson(x, y, w, h)
+            color = (0, 255, 0)
+            
+            if person.alert != 0:
+                color = (0, 0, 255)
+                if self.settings.debug:
+                    cv2.line(self.frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.line(self.frame, (x + w, y), (x, y + h), color, 2)
+                
+                if person.alert == 2:
+                    detectStatus = "Alarm! Person not moving"
+                if person.alert == 1:
+                    detectStatus = "Fall Detected!"
+                
+                if person.alarmReported == 0:
+                    file = f"alarm_person{person.id}_time{time.strftime('%Y%m%d_%H%M%S')}.png"
+                    cv2.imwrite(file, self.frame)
+                    self.webservice.alarm("fall detected", person.id, file)
+                    person.alarmReported = 1
+                    self.storeAlarmImages(file)
+                
+                if person.alarmReported == 1 and person.alert == 2:
+                    file = f"alarm_person{person.id}_time{time.strftime('%Y%m%d_%H%M%S')}.png"
+                    cv2.imwrite(file, self.frame)
+                    self.webservice.alarm("not moving", person.id, file)
+                    person.alarmReported = 2
+                    self.storeAlarmImages(file)
+            
+            if self.settings.debug:
+                cv2.rectangle(self.frame, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(self.frame, str(cv2.contourArea(contour)), 
+                    (x, y+h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 1)
+                cv2.putText(self.frame, f"{person.id}:{person.lastmoveTime}", 
+                    (x, y+20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 1)
+                
+                self.end = time.time()
+                seconds = self.end - self.start
+                if seconds == 0:
+                    seconds = 1
+                fps = round(1 / seconds, 1)
+                self.start = time.time()
+                cv2.putText(self.frame, f"Status: {detectStatus}", (10, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 1)
+                cv2.putText(self.frame, f"FPS: {fps}", (400, 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 1)
+
+    def newLightconditions(self):
+        self.errorcount += 1
+        if self.errorcount > 10:
+            time.sleep(1.0)
+            self.resetBackgroundFrame()
+            self.errorcount = 0
+
+    def storeAlarmImages(self, fileName):
+        cwd = os.getcwd()
+        directory = os.path.join(cwd, self.settings.alarmImagesFolder)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        currentFile = os.path.join(cwd, fileName)
+        movedFile = os.path.join(directory, fileName)
+        os.rename(currentFile, movedFile)

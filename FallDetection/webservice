@@ -1,0 +1,33 @@
+# Fall detector webservice - Telegram version
+# License: GPLv3
+import requests
+import os
+
+class Webservice(object):
+    def __init__(self, place, phone, telegram_token, telegram_chat_id):
+        # Telegram Bot API settings - ADD YOUR BOT TOKEN AND CHAT ID
+        self.telegram_token = telegram_token  # "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+        self.telegram_chat_id = telegram_chat_id  # "123456789" or "-123456789"
+        self.location = place
+        self.phone = phone
+
+    def send_telegram(self, caption, photo_path):
+        """Send photo + caption to Telegram"""
+        url = f"https://api.telegram.org/bot{self.telegram_token}/sendPhoto"
+        
+        with open(photo_path, "rb") as photo:
+            files = {"photo": photo}
+            data = {
+                "chat_id": self.telegram_chat_id,
+                "caption": f"{caption}\nLocation: {self.location}\nPhone: {self.phone}"
+            }
+            response = requests.post(url, files=files, data=data)
+            return response.json()
+
+    def alarm(self, detectiontype, personid, attachment):
+        subject = f'Alarm: {detectiontype} by person #{personid} at {self.location}'
+        print(subject + ' with attachment: ' + attachment)
+        
+        # Send to Telegram
+        response = self.send_telegram(subject, attachment)
+        print("Telegram response:", response.get("ok", False))
